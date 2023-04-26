@@ -1,0 +1,2 @@
+example_files/drums.wav filter=lfs diff=lfs merge=lfs -text
+example_files/singing.wav filter=lfs diff=lfs merge=lfs -text

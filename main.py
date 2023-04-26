@@ -1,12 +1,16 @@
+import logging
 import pathlib
+import time
 
 import torch
 import torch.nn.functional
 import torch.optim
 import torchaudio
 
+logger = logging.getLogger("texture_resynthesis")
 
-class Spectrogram(torch.nn.Module):
+
+class ResynthesisFeatures(torch.nn.Module):
 
     def __init__(self, audio, sample_rate):
         super().__init__()
@@ -19,8 +23,10 @@ class Spectrogram(torch.nn.Module):
         self.spectrogram = torchaudio.transforms.Spectrogram(**self.spectrogram_kwargs)
         self.target_spectrogram = self.spectrogram.forward(audio)
 
+        spectrogram_2_nfft = int(2.0 * sample_rate / hop_length)
         self.spectrogram_2 = torchaudio.transforms.Spectrogram(
-            n_fft=int(2.0 * sample_rate / hop_length),
+            n_fft=spectrogram_2_nfft,
+            hop_length=spectrogram_2_nfft // 4,
             power=1.0,
         )
 
@@ -30,7 +36,6 @@ class Spectrogram(torch.nn.Module):
             "spectral_flux": 5.0,
             "modulation_spectrogram_energy": 10.0,
             "covariance": 10.0,
-            "spectral_flatness": 10.0,
         }
         self.normalization_factors = {
             key: self.feature_weights.get(key, 1.0) / torch.sqrt(torch.mean(torch.square(value)))
@@ -94,7 +99,7 @@ class Spectrogram(torch.nn.Module):
 
 
 def resynthesize(audio, sample_rate):
-    model = Spectrogram(audio, sample_rate)
+    model = ResynthesisFeatures(audio, sample_rate)
 
     learning_rate = 1.0
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -103,7 +108,8 @@ def resynthesize(audio, sample_rate):
     spectrogram = None
 
     try:
-        for i in range(100):
+        for iteration_number in range(1, 100 + 1):
+            logger.info(f"--- Iteration #{iteration_number} ---")
             prediction = model.forward()
             loss = torch.nn.functional.mse_loss(prediction, model.target_features)
             loss.backward()
@@ -118,21 +124,22 @@ def resynthesize(audio, sample_rate):
                 learning_rate *= 0.5
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
+            logger.info(f"Loss = {float(loss):.2f} ({step_type}), learning rate = {learning_rate:.2f}")
             last_loss = loss
-            print(loss)
-            print(step_type)
             optimizer.step()
             optimizer.zero_grad()
+        else:
+            logger.info(f"Max iterations reached.")
     except KeyboardInterrupt:
-        pass
+        logger.warning("Interrupted by user.")
 
     # Zero out DC and Nyquist
     spectrogram[0, :] = 0
     spectrogram[-1, :] = 0
 
-    print("Running phase reconstruction...")
+    logger.debug("Running phase reconstruction.")
     griffin_lim = torchaudio.transforms.GriffinLim(**model.spectrogram_kwargs)
-    audio_in = griffin_lim.forward(spectrogram)
+    audio_out = griffin_lim.forward(spectrogram)
     return audio_out
 
 
@@ -150,10 +157,17 @@ def main():
         out_file_name = OUT_FILES / (file_name.stem + ".resynthesized.wav")
         audio_in, sample_rate = torchaudio.load(str(file_name))
         audio_in = audio_in[0, :int(sample_rate * 5.0)]
-        audio_out = resynthesize(audio_in, sample_rate)
         torchaudio.save(str(in_file_name), audio_in[None, :], sample_rate)
+        logging.info(f"Input file saved to {str(in_file_name)}.")
+        start = time.time()
+        audio_out = resynthesize(audio_in, sample_rate)
+        elapsed = int(time.time() - start)
+        minutes, seconds = divmod(elapsed, 60)
+        logging.info(f"Resynthesis took {minutes}m {seconds}s.")
         torchaudio.save(str(out_file_name), audio_out[None, :], sample_rate)
+        logging.info(f"Output file saved to {str(out_file_name)}.")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     main()
