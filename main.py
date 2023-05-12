@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 import scipy.interpolate
+import scipy.stats
 import torch
 import torch.nn.functional
 import torch.optim
@@ -78,16 +79,17 @@ class ResynthesisFeatures(torch.nn.Module):
     def __init__(self, audio, sample_rate):
         super().__init__()
         self.sample_rate = sample_rate
-        hop_length = 64
+        self.hop_length = 64
         self.spectrogram_kwargs = {
             "n_fft": 2048,
-            "hop_length": hop_length,
+            "hop_length": self.hop_length,
             "power": 1.0,
         }
         self.spectrogram = torchaudio.transforms.Spectrogram(**self.spectrogram_kwargs)
         self.target_spectrogram = self.spectrogram.forward(audio)
 
-        spectrogram_2_nfft = int(2.0 * self.sample_rate / hop_length)
+        self.frame_rate = self.hop_length / self.sample_rate
+        spectrogram_2_nfft = int(2.0 / self.frame_rate)
         self.spectrogram_2 = torchaudio.transforms.Spectrogram(
             n_fft=spectrogram_2_nfft,
             hop_length=spectrogram_2_nfft // 4,
@@ -102,6 +104,7 @@ class ResynthesisFeatures(torch.nn.Module):
             "covariance": 10.0,
             "spectral_flatness_energy": 50.0,
             "spectral_flatness_variance": 50.0,
+            "transient": 20.0,
         }
         self.normalization_factors = {
             key: self.feature_weights.get(key, 1.0) / torch.sqrt(torch.mean(torch.square(value)))
@@ -112,11 +115,13 @@ class ResynthesisFeatures(torch.nn.Module):
             torch.rand(self.target_spectrogram.shape) * torch.mean(self.target_spectrogram)
         )
 
-    def get_stats(self, spectrogram, prefix):
-        energy = torch.mean(spectrogram, axis=-1)
-        variance = torch.var(spectrogram, axis=-1)
-        skewness = torch.sum((spectrogram - energy[..., None]) ** 3, axis=-1)
-        kurtosis = torch.sum((spectrogram - energy[..., None]) ** 4, axis=-1)
+    def get_stats(self, tensor, prefix, weights=1.0):
+        """Compute a standard set of statistics over the final axis of a tensor.
+        """
+        energy = torch.mean(tensor, axis=-1) * weights
+        variance = torch.var(tensor, axis=-1) * weights
+        skewness = torch.sum((tensor - energy[..., None]) ** 3, axis=-1) * weights
+        kurtosis = torch.sum((tensor - energy[..., None]) ** 4, axis=-1) * weights
         return {
             f"{prefix}_energy": energy,
             f"{prefix}_variance": variance,
@@ -127,6 +132,7 @@ class ResynthesisFeatures(torch.nn.Module):
     def get_unnormalized_features(self, spectrogram):
         result = {}
 
+        bin_indices = np.arange(spectrogram.shape[0])
         bin_freqs = np.linspace(
             0, self.sample_rate / 2, spectrogram.shape[0]
         )
@@ -135,32 +141,45 @@ class ResynthesisFeatures(torch.nn.Module):
         # Remove DC and Nyquist
         frequency_slice = slice(1, -1)
         s = spectrogram[frequency_slice, :]
+        bin_indices = bin_indices[frequency_slice]
         bin_freqs = bin_freqs[frequency_slice]
-        s = s * torch.from_numpy(frequency_to_weight(bin_freqs[:, None]))
-        result.update(self.get_stats(s, prefix="spectrogram"))
+        weights = torch.from_numpy(frequency_to_weight(bin_freqs))
 
-        energy_by_frame = torch.mean(spectrogram, axis=0)
-        result["spectral_variance"] = torch.mean(torch.var(spectrogram, axis=0))
-        result["spectral_skewness"] = torch.mean((spectrogram - energy_by_frame[None, ...]) ** 3)
-        result["spectral_kurtosis"] = torch.mean((spectrogram - energy_by_frame[None, ...]) ** 4)
+        result.update(self.get_stats(s, prefix="spectrogram", weights=weights))
+
+        # Multiply by weights after computing stats, as the "energy" stat is weight-aware.
+        s = s * weights[:, None]
+
+        energy_by_frame = torch.mean(s, axis=0)
+        result["spectral_variance"] = torch.mean(torch.var(s, axis=0))
+        result["spectral_skewness"] = torch.mean((s - energy_by_frame[None, ...]) ** 3)
+        result["spectral_kurtosis"] = torch.mean((s - energy_by_frame[None, ...]) ** 4)
 
         spectral_flatness = get_spectral_flatness(s)
         result.update(self.get_stats(spectral_flatness, prefix="spectral_flatness"))
 
-        result["spectral_flux"] = torch.mean(torch.abs(torch.diff(spectrogram, axis=1)), axis=1)
+        result["spectral_flux"] = torch.mean(torch.abs(torch.diff(s, axis=1)), axis=1)
 
         result.update(self.get_stats(energy_by_frame, prefix="energy"))
 
         covariance = torch.cov(s)
         result["covariance"] = covariance
 
+        s_squared = s * s
+        transient = torch.sqrt(torch.mean(s_squared[:, :-1] / (s_squared[:, 1:] + 1e-3), axis=-1))
+        result["transient"] = transient
+
         # Dimensions of s2: (audio frequency, modulation frequency, time)
         s2 = self.spectrogram_2.forward(s)
+        mod_freqs = torch.arange(s2.shape[1])
         # Ignore dc, as it is already captured by energy.
         s2 = s2[:, 1:, :]
+        mod_freqs = mod_freqs[1:]
         # 1/f weighting for modulation frequency.
-        s2 *= (1 / (1 + torch.arange(s2.shape[1])))[None, :, None]
-        result.update(self.get_stats(s2, prefix="modulation_spectrogram"))
+        mod_weights = mod_freqs ** -0.5
+        mod_weights = mod_weights[None, :]
+
+        result.update(self.get_stats(s2, prefix="modulation_spectrogram", weights=mod_weights))
 
         return result
 
@@ -199,27 +218,31 @@ def resynthesize(
     def loss_to_error(loss):
         return np.sqrt(float(loss / reference_loss))
 
-    noise_floor_table_db = np.linspace(-60.0, 0.0, 10)
-    noise_floor_table_linear = db_to_linear(noise_floor_table_db)
-    noise_floor_table_error = []
+    logger.debug("Building SNR table...")
+
+    snr_table_linear = db_to_linear(np.linspace(10.0, 60.0, 10))
+    inv_snr_table_linear = 1 / snr_table_linear
     reference_rms = torch.sqrt(torch.mean(torch.square(audio)))
 
-    for noise_floor in noise_floor_table_linear:
-        noise = torch.normal(0, noise_floor, audio.shape) * reference_rms
+    snr_table_error = []
+    for snr in snr_table_linear:
+        noise = torch.normal(0.0, 1.0, audio.shape) * reference_rms / snr
         noisy_audio = audio + noise
         noisy_features = model.get_features(model.spectrogram(noisy_audio))
-        noise_floor_table_error.append(
+        snr_table_error.append(
             loss_to_error(loss_function(noisy_features, model.target_features))
         )
 
-    noise_floor_interpolator = scipy.interpolate.interp1d(
-        noise_floor_table_error,
-        noise_floor_table_linear,
-        fill_value="extrapolate",
+    regression_result = scipy.stats.linregress(snr_table_error, inv_snr_table_linear)
+    logger.debug(
+        f"Built SNR table. "
+        f"Slope = {regression_result.slope:.2f} \u00B1 {regression_result.stderr:.2f}, "
+        f"intercept = {regression_result.intercept:.2f} \u00B1 {regression_result.intercept_stderr:.2f}"
     )
+    snr_interpolator = scipy.interpolate.interp1d(snr_table_error, inv_snr_table_linear, fill_value="extrapolate")
 
     error_history = []
-    noise_floor_history = []
+    snr_history = []
     try:
         for iteration_number in range(1, 100 + 1):
             logger.info(f"--- Iteration #{iteration_number} ---")
@@ -235,14 +258,14 @@ def resynthesize(
                 step_type = "worse"
 
             error = loss_to_error(loss)
-            noise_floor_linear = noise_floor_interpolator(error)
-            noise_floor_db = linear_to_db(noise_floor_linear)
+            inv_snr_linear = snr_interpolator(error)
+            snr_db = linear_to_db(1 / inv_snr_linear)
 
             error_history.append(error)
-            noise_floor_history.append(noise_floor_db)
+            snr_history.append(snr_db)
             logger.info(
                 f"Error = {error * 100:.2f}% ({step_type}), "
-                f"estimated noise floor = {noise_floor_db:+.2f} dB"
+                f"estimated SNR = {snr_db:.2f} dB"
             )
             last_loss = loss
             optimizer.step()
@@ -266,7 +289,7 @@ def resynthesize(
 
     info = {
         "error_history": error_history,
-        "noise_floor_history": noise_floor_history,
+        "snr_history": snr_history,
         "time_elapsed": time_elapsed,
         "time_elapsed_string": time_elapsed_string,
     }
@@ -288,11 +311,11 @@ def run_batch():
         audio_in, sample_rate = torchaudio.load(str(file_name))
         audio_in = audio_in[0, :int(sample_rate * 5.0)]
         torchaudio.save(str(in_file_name), audio_in[None, :], sample_rate)
-        logging.info(f"Input file saved to {str(in_file_name)}.")
+        logger.info(f"Input file saved to {str(in_file_name)}.")
         audio_out, info = resynthesize(audio_in, sample_rate)
-        logging.info(f"Resynthesis took {info['time_elapsed_string']}.")
+        logger.info(f"Resynthesis took {info['time_elapsed_string']}.")
         torchaudio.save(str(out_file_name), audio_out[None, :], sample_rate)
-        logging.info(f"Output file saved to {str(out_file_name)}.")
+        logger.info(f"Output file saved to {str(out_file_name)}.")
 
 
 def main():
@@ -308,14 +331,14 @@ def main():
     audio_in, sample_rate = torchaudio.load(str(in_file_path))
     audio_in = audio_in[0, :int(sample_rate * 5.0)]
     torchaudio.save(str(truncated_file_path), audio_in[None, :], sample_rate)
-    logging.info(f"Truncated input file saved to {str(truncated_file_path)}.")
+    logger.info(f"Truncated input file saved to {str(truncated_file_path)}.")
     audio_out, info = resynthesize(audio_in, sample_rate)
-    logging.info(f"Resynthesis took {info['time_elapsed_string']}.")
+    logger.info(f"Resynthesis took {info['time_elapsed_string']}.")
     torchaudio.save(str(out_file_path), audio_out[None, :], sample_rate)
-    logging.info(f"Output file saved to {str(out_file_path)}.")
+    logger.info(f"Output file saved to {str(out_file_path)}.")
     with open(str(info_file_path), "w") as file:
         json.dump(info, file, indent=4)
-    logging.info(f"Info file saved to {str(info_file_path)}.")
+    logger.info(f"Info file saved to {str(info_file_path)}.")
 
 
 if __name__ == "__main__":
