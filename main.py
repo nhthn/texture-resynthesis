@@ -52,6 +52,8 @@ def db_to_linear(db):
 
 
 def linear_to_db(linear):
+    if isinstance(linear, torch.Tensor):
+        return 20 * torch.log10(linear)
     return 20 * np.log10(linear)
 
 
@@ -86,7 +88,9 @@ class ResynthesisFeatures(torch.nn.Module):
             "power": 1.0,
         }
         self.spectrogram = torchaudio.transforms.Spectrogram(**self.spectrogram_kwargs)
-        self.target_spectrogram = self.spectrogram.forward(audio)
+        self.target_log_spectrogram = self.compute_log_spectrogram(audio)
+        if torch.any(torch.isnan(self.target_log_spectrogram)):
+            raise ValueError("NaN detected in log spectrogram")
 
         self.frame_rate = self.hop_length / self.sample_rate
         spectrogram_2_nfft = int(2.0 / self.frame_rate)
@@ -96,7 +100,7 @@ class ResynthesisFeatures(torch.nn.Module):
             power=1.0,
         )
 
-        target_features_unnormalized = self.get_unnormalized_features(self.target_spectrogram)
+        target_features_unnormalized = self.get_unnormalized_features(self.target_log_spectrogram)
         self.feature_weights = {
             "spectrogram_energy": 8.0,
             "spectral_flux": 5.0,
@@ -111,9 +115,14 @@ class ResynthesisFeatures(torch.nn.Module):
             for key, value in target_features_unnormalized.items()
         }
         self.target_features = self.normalize_features(target_features_unnormalized)
-        self.estimated_spectrogram = torch.nn.Parameter(
-            torch.rand(self.target_spectrogram.shape) * torch.mean(self.target_spectrogram)
+        self.estimated_log_spectrogram = torch.nn.Parameter(
+            torch.randn_like(self.target_log_spectrogram)
+            * torch.std(self.target_log_spectrogram)
+            + torch.median(self.target_log_spectrogram)
         )
+
+    def compute_log_spectrogram(self, audio):
+        return linear_to_db(self.spectrogram(audio))
 
     def get_stats(self, tensor, prefix, weights=1.0):
         """Compute a standard set of statistics over the final axis of a tensor.
@@ -129,25 +138,28 @@ class ResynthesisFeatures(torch.nn.Module):
             f"{prefix}_kurtosis": kurtosis,
         }
 
-    def get_unnormalized_features(self, spectrogram):
+    def get_unnormalized_features(self, log_spectrogram):
         result = {}
 
-        bin_indices = np.arange(spectrogram.shape[0])
+        bin_indices = np.arange(log_spectrogram.shape[0])
         bin_freqs = np.linspace(
-            0, self.sample_rate / 2, spectrogram.shape[0]
+            0, self.sample_rate / 2, log_spectrogram.shape[0]
         )
 
         # Dimensions of s: (frequency, time)
         # Remove DC and Nyquist
         frequency_slice = slice(1, -1)
-        s = spectrogram[frequency_slice, :]
+        s_db = log_spectrogram[frequency_slice, :]
         bin_indices = bin_indices[frequency_slice]
         bin_freqs = bin_freqs[frequency_slice]
         weights = torch.from_numpy(frequency_to_weight(bin_freqs))
 
-        result.update(self.get_stats(s, prefix="spectrogram", weights=weights))
+        result.update(self.get_stats(s_db, prefix="spectrogram"))
 
-        # Multiply by weights after computing stats, as the "energy" stat is weight-aware.
+        s = db_to_linear(s_db)
+        # There is no need to weight s_db with inverse equal-loudness curves as multiplication
+        # by the curve results in a translation in the dB domain, and all features except
+        # energy are translation-invariant.
         s = s * weights[:, None]
 
         energy_by_frame = torch.mean(s, axis=0)
@@ -175,7 +187,7 @@ class ResynthesisFeatures(torch.nn.Module):
         # Ignore dc, as it is already captured by energy.
         s2 = s2[:, 1:, :]
         mod_freqs = mod_freqs[1:]
-        # 1/f weighting for modulation frequency.
+        # Power law weighting for modulation frequency.
         mod_weights = mod_freqs ** -0.5
         mod_weights = mod_weights[None, :]
 
@@ -193,12 +205,17 @@ class ResynthesisFeatures(torch.nn.Module):
         return self.normalize_features(self.get_unnormalized_features(spectrogram))
 
     def forward(self):
-        return self.get_features(self.estimated_spectrogram)
+        return self.get_features(self.estimated_log_spectrogram)
+
+    def get_log_spectrogram(self):
+        return self.estimated_log_spectrogram.detach()
 
 
 def resynthesize(
     audio,
     sample_rate,
+    max_iterations=100,
+    target_snr_db=60,
 ):
     start = time.time()
 
@@ -207,7 +224,7 @@ def resynthesize(
     optimizer = torch.optim.Rprop(model.parameters(), lr=1.0)
 
     last_loss = None
-    spectrogram = None
+    log_spectrogram = None
 
     loss_function = torch.nn.functional.mse_loss
     reference_loss = loss_function(
@@ -228,7 +245,7 @@ def resynthesize(
     for snr in snr_table_linear:
         noise = torch.normal(0.0, 1.0, audio.shape) * reference_rms / snr
         noisy_audio = audio + noise
-        noisy_features = model.get_features(model.spectrogram(noisy_audio))
+        noisy_features = model.get_features(model.compute_log_spectrogram(noisy_audio))
         snr_table_error.append(
             loss_to_error(loss_function(noisy_features, model.target_features))
         )
@@ -244,7 +261,7 @@ def resynthesize(
     error_history = []
     snr_history = []
     try:
-        for iteration_number in range(1, 100 + 1):
+        for iteration_number in range(1, max_iterations + 1):
             logger.info(f"--- Iteration #{iteration_number} ---")
             prediction = model.forward()
             loss = loss_function(prediction, model.target_features)
@@ -253,7 +270,7 @@ def resynthesize(
                 step_type = "initial"
             elif loss < last_loss:
                 step_type = "better"
-                spectrogram = model.estimated_spectrogram.detach()
+                log_spectrogram = model.get_log_spectrogram()
             else:
                 step_type = "worse"
 
@@ -267,6 +284,11 @@ def resynthesize(
                 f"Error = {error * 100:.2f}% ({step_type}), "
                 f"estimated SNR = {snr_db:.2f} dB"
             )
+            if error > 1e3:
+                raise ValueError("Very high relative error, something is wrong")
+            if snr_db > target_snr_db:
+                logger.info("Target SNR reached.")
+                break
             last_loss = loss
             optimizer.step()
             optimizer.zero_grad()
@@ -275,6 +297,7 @@ def resynthesize(
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
 
+    spectrogram = db_to_linear(log_spectrogram)
     # Zero out DC and Nyquist
     spectrogram[0, :] = 0
     spectrogram[-1, :] = 0
@@ -302,43 +325,39 @@ IN_FILES = ROOT / "in_files"
 OUT_FILES = ROOT / "out_files"
 
 
-def run_batch():
-    OUT_FILES.mkdir(exist_ok=True)
-    IN_FILES.mkdir(exist_ok=True)
-    for file_name in EXAMPLE_FILES.glob("*.wav"):
-        in_file_name = IN_FILES / (file_name.stem + ".wav")
-        out_file_name = OUT_FILES / (file_name.stem + ".resynthesized.wav")
-        audio_in, sample_rate = torchaudio.load(str(file_name))
-        audio_in = audio_in[0, :int(sample_rate * 5.0)]
-        torchaudio.save(str(in_file_name), audio_in[None, :], sample_rate)
-        logger.info(f"Input file saved to {str(in_file_name)}.")
-        audio_out, info = resynthesize(audio_in, sample_rate)
-        logger.info(f"Resynthesis took {info['time_elapsed_string']}.")
-        torchaudio.save(str(out_file_name), audio_out[None, :], sample_rate)
-        logger.info(f"Output file saved to {str(out_file_name)}.")
+def process_one_file(in_file_path, tag=None, length_in_seconds=5.0):
+    stem = in_file_path.stem
+    if tag is not None:
+        stem = stem + "." + tag
+    truncated_file_path = in_file_path.parent / (stem + ".truncated.wav")
+    out_file_path = in_file_path.parent / (stem + ".resynthesized.wav")
+    info_file_path = in_file_path.parent / (stem + ".info.json")
+
+    audio_in, sample_rate = torchaudio.load(str(in_file_path))
+    audio_in = audio_in[0, :int(sample_rate * length_in_seconds)]
+    torchaudio.save(str(truncated_file_path), audio_in[None, :], sample_rate)
+    logger.info(f"Truncated input file saved to {str(truncated_file_path)}.")
+
+    audio_out, info = resynthesize(audio_in, sample_rate)
+    logger.info(f"Resynthesis took {info['time_elapsed_string']}.")
+
+    torchaudio.save(str(out_file_path), audio_out[None, :], sample_rate)
+    logger.info(f"Output file saved to {str(out_file_path)}.")
+
+    with open(str(info_file_path), "w") as file:
+        json.dump(info, file, indent=4)
+    logger.info(f"Info file saved to {str(info_file_path)}.")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("in_file", type=str)
+    parser.add_argument("in_files", type=str, nargs="+")
+    parser.add_argument("-t", "--tag", type=str)
     args = parser.parse_args()
 
-    in_file_path = pathlib.Path(args.in_file)
-    truncated_file_path = in_file_path.parent / (in_file_path.stem + ".truncated.wav")
-    out_file_path = in_file_path.parent / (in_file_path.stem + ".resynthesized.wav")
-    info_file_path = in_file_path.parent / (in_file_path.stem + ".info.json")
-
-    audio_in, sample_rate = torchaudio.load(str(in_file_path))
-    audio_in = audio_in[0, :int(sample_rate * 5.0)]
-    torchaudio.save(str(truncated_file_path), audio_in[None, :], sample_rate)
-    logger.info(f"Truncated input file saved to {str(truncated_file_path)}.")
-    audio_out, info = resynthesize(audio_in, sample_rate)
-    logger.info(f"Resynthesis took {info['time_elapsed_string']}.")
-    torchaudio.save(str(out_file_path), audio_out[None, :], sample_rate)
-    logger.info(f"Output file saved to {str(out_file_path)}.")
-    with open(str(info_file_path), "w") as file:
-        json.dump(info, file, indent=4)
-    logger.info(f"Info file saved to {str(info_file_path)}.")
+    for file_name in args.in_files:
+        in_file_path = pathlib.Path(file_name)
+        process_one_file(in_file_path, tag=args.tag)
 
 
 if __name__ == "__main__":
