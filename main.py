@@ -277,11 +277,16 @@ def resynthesize(
         )
 
     regression_result = scipy.stats.linregress(snr_table_error, inv_snr_table_linear)
+    r_squared = regression_result.rvalue * regression_result.rvalue
     logger.debug(
         f"Built SNR table. "
         f"Slope = {regression_result.slope:.2f} \u00B1 {regression_result.stderr:.2f}, "
-        f"intercept = {regression_result.intercept:.2f} \u00B1 {regression_result.intercept_stderr:.2f}"
+        f"intercept = {regression_result.intercept:.2f} \u00B1 {regression_result.intercept_stderr:.2f}, "
+        f"R^2 = {r_squared:.2f}"
     )
+    r_squared_thresold = 0.9
+    if r_squared < r_squared_thresold:
+        logger.warning(f"R^2 of SNR table < {r_squared_thresold}. SNR estimator may be inaccurate.")
     snr_interpolator = scipy.interpolate.interp1d(snr_table_error, inv_snr_table_linear, fill_value="extrapolate")
 
     error_history = []
