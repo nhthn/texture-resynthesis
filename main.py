@@ -51,6 +51,19 @@ def db_to_linear(db):
     return 10 ** (db / 20)
 
 
+def safe_db_to_linear(db):
+    """An alternative to traditional dB-to-linear conversion that ensures that large dB
+    values do not produce huge partial derivatives of the loss function, which can cause
+    major issues in the optimizer.
+
+    I initially tried clamping the dB value to a maximum but this makes the partial
+    derivative undefined and effectively freezes the bin value, resulting in very loud
+    isolated "chirps." Using a linear slope above the threshold is a reasonable middle
+    ground.
+    """
+    return torch.minimum(db_to_linear(db), torch.abs(db) + 1)
+
+
 def linear_to_db(linear):
     if isinstance(linear, torch.Tensor):
         return 20 * torch.log10(linear)
@@ -73,6 +86,16 @@ def get_spectral_flatness(spectrum, axis=0):
     return (
         torch.exp(torch.mean(spectrum, axis=axis))
         / (1 + torch.mean(torch.abs(spectrum), axis=axis))
+    )
+
+
+def print_log_spectrogram_summary_stats(prefix, log_spectrogram):
+    s = log_spectrogram.detach()
+    logger.info(
+        f"{prefix}: "
+        f"mean = {torch.mean(s):.2f} dB, "
+        f"median = {torch.median(s):.2f} dB, "
+        f"stdev = {torch.std(s):.2f} dB"
     )
 
 
@@ -156,7 +179,7 @@ class ResynthesisFeatures(torch.nn.Module):
 
         result.update(self.get_stats(s_db, prefix="spectrogram"))
 
-        s = db_to_linear(s_db)
+        s = safe_db_to_linear(s_db)
         # There is no need to weight s_db with inverse equal-loudness curves as multiplication
         # by the curve results in a translation in the dB domain, and all features except
         # energy are translation-invariant.
@@ -220,6 +243,9 @@ def resynthesize(
     start = time.time()
 
     model = ResynthesisFeatures(audio, sample_rate)
+    print_log_spectrogram_summary_stats(
+        "Target spectrogram", model.target_log_spectrogram
+    )
 
     optimizer = torch.optim.Rprop(model.parameters(), lr=1.0)
 
@@ -284,7 +310,7 @@ def resynthesize(
                 f"Error = {error * 100:.2f}% ({step_type}), "
                 f"estimated SNR = {snr_db:.2f} dB"
             )
-            if error > 1e3:
+            if error > 1e10 or np.isnan(error):
                 raise ValueError("Very high relative error, something is wrong")
             if snr_db > target_snr_db:
                 logger.info("Target SNR reached.")
