@@ -8,6 +8,7 @@ import numpy as np
 import scipy.interpolate
 import scipy.stats
 import torch
+import torch.autograd
 import torch.linalg
 import torch.nn.functional
 import torch.optim
@@ -58,15 +59,24 @@ def linear_to_db(linear):
     return 20 * np.log10(linear)
 
 
+# See: Roodschild, Sardiñas, and Will. 2020.
+# "A new approach for the vanishing gradient problem on sigmoid activation."
+# https://link.springer.com/content/pdf/10.1007/s13748-020-00218-y.pdf
+BETA = 0.1
+
+
 def linear_to_p(linear):
     """Convert linear amplitude units to "P-units," a made-up psychoacoustic unit of volume
     optimized for gradient descent on the differences between spectrogram amplitudes."""
-    return linear
+    return 20 * torch.log10(1 + torch.abs(linear)) * torch.sign(linear)
 
 
 def p_to_linear(p):
-    """Convert P-units (see docs for linear_to_p) back to linear units."""
-    return p
+    """Approximately convert P-units (see docs for linear_to_p) back to linear units.
+
+    The inversion does not perfectly recover the original value.
+    """
+    return ((10 ** torch.abs(p / 20)) - 1) * torch.sign(p)
 
 
 def frequency_to_weight(freqs):
@@ -172,7 +182,7 @@ class ResynthesisFeatures(torch.nn.Module):
             f"{prefix}_energy": energy,
             f"{prefix}_variance": variance,
             f"{prefix}_skewness": skewness,
-            # f"{prefix}_kurtosis": kurtosis,
+            f"{prefix}_kurtosis": kurtosis,
         }
 
     def get_unnormalized_features(self, p_spectrogram):
@@ -191,12 +201,12 @@ class ResynthesisFeatures(torch.nn.Module):
         bin_freqs = bin_freqs[frequency_slice]
         weights = torch.from_numpy(frequency_to_weight(bin_freqs))
 
-        # result.update(self.get_stats(s_p, prefix="p_spectrogram"))
+        result.update(self.get_stats(s_p, prefix="p_spectrogram"))
 
         s = p_to_linear(s_p)
         s = s * weights[:, None]
 
-        result.update(self.get_stats(s, prefix="spectrogram"))
+        # result.update(self.get_stats(s, prefix="spectrogram"))
 
         energy_by_frame = torch.mean(s, axis=0)
         result["spectral_variance"] = torch.mean(torch.var(s, axis=0))
@@ -237,9 +247,9 @@ class ResynthesisFeatures(torch.nn.Module):
         for key, value in cwt_stats.items():
             cwt_stats[key] = torch.stack(value)
         del cwt_stats["spectrogram_cwt_skewness"]
-        # del cwt_stats["spectrogram_cwt_kurtosis"]
+        del cwt_stats["spectrogram_cwt_kurtosis"]
 
-        # result.update(cwt_stats)
+        result.update(cwt_stats)
 
         return result
 
@@ -273,9 +283,6 @@ def resynthesize(
     )
 
     optimizer = torch.optim.Rprop(model.parameters(), lr=1.0)
-
-    last_loss = None
-    p_spectrogram = None
 
     loss_function = torch.nn.functional.mse_loss
     reference_loss = loss_function(
@@ -314,21 +321,27 @@ def resynthesize(
         logger.warning(f"R^2 of SNR table < {r_squared_thresold}. SNR estimator may be inaccurate.")
     snr_interpolator = scipy.interpolate.interp1d(snr_table_error, inv_snr_table_linear, fill_value="extrapolate")
 
+    last_loss = None
+    best_loss = np.inf
+    p_spectrogram = None
     error_history = []
     snr_history = []
     try:
         for iteration_number in range(1, max_iterations + 1):
             logger.info(f"--- Iteration #{iteration_number} ---")
             prediction = model.forward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 100.0)
             loss = loss_function(prediction, model.target_features)
             loss.backward()
             if last_loss is None:
                 step_type = "initial"
             elif loss < last_loss:
                 step_type = "better"
-                p_spectrogram = model.get_p_spectrogram()
             else:
                 step_type = "worse"
+            if loss < best_loss:
+                p_spectrogram = model.get_p_spectrogram()
+                best_loss = loss
 
             error = loss_to_error(loss)
             inv_snr_linear = snr_interpolator(error)
@@ -338,7 +351,8 @@ def resynthesize(
             snr_history.append(snr_db)
             logger.info(
                 f"Error = {error * 100:.2f}% ({step_type}), "
-                f"estimated SNR = {snr_db:.2f} dB"
+                f"estimated SNR = {snr_db:.2f} dB, "
+                f"gradient norm = {grad_norm:.2f}"
             )
             if error > 1e10 or np.isnan(error):
                 raise ValueError("Very high relative error, something is wrong")
