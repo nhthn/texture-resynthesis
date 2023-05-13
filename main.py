@@ -8,6 +8,7 @@ import numpy as np
 import scipy.interpolate
 import scipy.stats
 import torch
+import torch.linalg
 import torch.nn.functional
 import torch.optim
 import torchaudio
@@ -51,23 +52,21 @@ def db_to_linear(db):
     return 10 ** (db / 20)
 
 
-def safe_db_to_linear(db):
-    """An alternative to traditional dB-to-linear conversion that ensures that large dB
-    values do not produce huge partial derivatives of the loss function, which can cause
-    major issues in the optimizer.
-
-    I initially tried clamping the dB value to a maximum but this makes the partial
-    derivative undefined and effectively freezes the bin value, resulting in very loud
-    isolated "chirps." Using a linear slope above the threshold is a reasonable middle
-    ground.
-    """
-    return torch.minimum(db_to_linear(db), torch.abs(db) + 1)
-
-
 def linear_to_db(linear):
     if isinstance(linear, torch.Tensor):
         return 20 * torch.log10(linear)
     return 20 * np.log10(linear)
+
+
+def linear_to_p(linear):
+    """Convert linear amplitude units to "P-units," a made-up psychoacoustic unit of volume
+    optimized for gradient descent on the differences between spectrogram amplitudes."""
+    return linear
+
+
+def p_to_linear(p):
+    """Convert P-units (see docs for linear_to_p) back to linear units."""
+    return p
 
 
 def frequency_to_weight(freqs):
@@ -82,21 +81,41 @@ def frequency_to_weight(freqs):
 
 
 def get_spectral_flatness(spectrum, axis=0):
-    log_spectrogram = torch.log(1 + torch.abs(spectrum))
+    p_spectrogram = torch.log(1 + torch.abs(spectrum))
     return (
         torch.exp(torch.mean(spectrum, axis=axis))
         / (1 + torch.mean(torch.abs(spectrum), axis=axis))
     )
 
 
-def print_log_spectrogram_summary_stats(prefix, log_spectrogram):
-    s = log_spectrogram.detach()
+def print_p_spectrogram_summary_stats(prefix, p_spectrogram):
+    s = p_spectrogram.detach()
     logger.info(
         f"{prefix}: "
-        f"mean = {torch.mean(s):.2f} dB, "
-        f"median = {torch.median(s):.2f} dB, "
-        f"stdev = {torch.std(s):.2f} dB"
+        f"mean = {torch.mean(s):.2f} p, "
+        f"median = {torch.median(s):.2f} p, "
+        f"stdev = {torch.std(s):.2f} p"
     )
+
+
+def get_cwt(array, sample_rate, scales):
+    bins = []
+    for scale in scales:
+        window_size = int(scale * sample_rate)
+        hop_size = window_size // 4
+        window = (
+            torch.hann_window(window_size)
+            # * torch.sin(2 * torch.pi * torch.arange(window_size) / window_size)
+            * scale ** 0.5
+        )
+        # Dimensions: (..., frame, time)
+        windows = array.unfold(-1, window_size, hop_size)
+        while window.ndim < windows.ndim:
+            window = torch.unsqueeze(window, dim=0)
+        windows = windows * window
+        bin_ = torch.abs(torch.sum(windows, dim=-1))
+        bins.append(bin_)
+    return bins
 
 
 class ResynthesisFeatures(torch.nn.Module):
@@ -111,41 +130,36 @@ class ResynthesisFeatures(torch.nn.Module):
             "power": 1.0,
         }
         self.spectrogram = torchaudio.transforms.Spectrogram(**self.spectrogram_kwargs)
-        self.target_log_spectrogram = self.compute_log_spectrogram(audio)
-        if torch.any(torch.isnan(self.target_log_spectrogram)):
+        self.target_p_spectrogram = self.compute_p_spectrogram(audio)
+        if torch.any(torch.isnan(self.target_p_spectrogram)):
             raise ValueError("NaN detected in log spectrogram")
 
-        self.frame_rate = self.hop_length / self.sample_rate
-        spectrogram_2_nfft = int(2.0 / self.frame_rate)
-        self.spectrogram_2 = torchaudio.transforms.Spectrogram(
-            n_fft=spectrogram_2_nfft,
-            hop_length=spectrogram_2_nfft // 4,
-            power=1.0,
-        )
+        self.frame_rate = self.sample_rate / self.hop_length
 
-        target_features_unnormalized = self.get_unnormalized_features(self.target_log_spectrogram)
+        target_features_unnormalized = self.get_unnormalized_features(self.target_p_spectrogram)
         self.feature_weights = {
+            "p_spectrogram_energy": 5.0,
             "spectrogram_energy": 8.0,
             "spectral_flux": 5.0,
-            "modulation_spectrogram_energy": 10.0,
             "covariance": 10.0,
             "spectral_flatness_energy": 50.0,
             "spectral_flatness_variance": 50.0,
             "transient": 20.0,
+            "modulation_cwt": 10.0,
         }
         self.normalization_factors = {
             key: self.feature_weights.get(key, 1.0) / torch.sqrt(torch.mean(torch.square(value)))
             for key, value in target_features_unnormalized.items()
         }
         self.target_features = self.normalize_features(target_features_unnormalized)
-        self.estimated_log_spectrogram = torch.nn.Parameter(
-            torch.randn_like(self.target_log_spectrogram)
-            * torch.std(self.target_log_spectrogram)
-            + torch.median(self.target_log_spectrogram)
+        self.estimated_p_spectrogram = torch.nn.Parameter(
+            torch.clip(torch.randn_like(self.target_p_spectrogram), -3, 1)
+            * torch.std(self.target_p_spectrogram)
+            + torch.median(self.target_p_spectrogram)
         )
 
-    def compute_log_spectrogram(self, audio):
-        return linear_to_db(self.spectrogram(audio))
+    def compute_p_spectrogram(self, audio):
+        return linear_to_p(self.spectrogram(audio))
 
     def get_stats(self, tensor, prefix, weights=1.0):
         """Compute a standard set of statistics over the final axis of a tensor.
@@ -158,40 +172,39 @@ class ResynthesisFeatures(torch.nn.Module):
             f"{prefix}_energy": energy,
             f"{prefix}_variance": variance,
             f"{prefix}_skewness": skewness,
-            f"{prefix}_kurtosis": kurtosis,
+            # f"{prefix}_kurtosis": kurtosis,
         }
 
-    def get_unnormalized_features(self, log_spectrogram):
+    def get_unnormalized_features(self, p_spectrogram):
         result = {}
 
-        bin_indices = np.arange(log_spectrogram.shape[0])
+        bin_indices = np.arange(p_spectrogram.shape[0])
         bin_freqs = np.linspace(
-            0, self.sample_rate / 2, log_spectrogram.shape[0]
+            0, self.sample_rate / 2, p_spectrogram.shape[0]
         )
 
         # Dimensions of s: (frequency, time)
         # Remove DC and Nyquist
         frequency_slice = slice(1, -1)
-        s_db = log_spectrogram[frequency_slice, :]
+        s_p = p_spectrogram[frequency_slice, :]
         bin_indices = bin_indices[frequency_slice]
         bin_freqs = bin_freqs[frequency_slice]
         weights = torch.from_numpy(frequency_to_weight(bin_freqs))
 
-        result.update(self.get_stats(s_db, prefix="spectrogram"))
+        # result.update(self.get_stats(s_p, prefix="p_spectrogram"))
 
-        s = safe_db_to_linear(s_db)
-        # There is no need to weight s_db with inverse equal-loudness curves as multiplication
-        # by the curve results in a translation in the dB domain, and all features except
-        # energy are translation-invariant.
+        s = p_to_linear(s_p)
         s = s * weights[:, None]
+
+        result.update(self.get_stats(s, prefix="spectrogram"))
 
         energy_by_frame = torch.mean(s, axis=0)
         result["spectral_variance"] = torch.mean(torch.var(s, axis=0))
         result["spectral_skewness"] = torch.mean((s - energy_by_frame[None, ...]) ** 3)
         result["spectral_kurtosis"] = torch.mean((s - energy_by_frame[None, ...]) ** 4)
 
-        spectral_flatness = get_spectral_flatness(s)
-        result.update(self.get_stats(spectral_flatness, prefix="spectral_flatness"))
+        # spectral_flatness = get_spectral_flatness(s)
+        # result.update(self.get_stats(spectral_flatness, prefix="spectral_flatness"))
 
         result["spectral_flux"] = torch.mean(torch.abs(torch.diff(s, axis=1)), axis=1)
 
@@ -204,17 +217,29 @@ class ResynthesisFeatures(torch.nn.Module):
         transient = torch.sqrt(torch.mean(s_squared[:, :-1] / (s_squared[:, 1:] + 1e-3), axis=-1))
         result["transient"] = transient
 
-        # Dimensions of s2: (audio frequency, modulation frequency, time)
-        s2 = self.spectrogram_2.forward(s)
-        mod_freqs = torch.arange(s2.shape[1])
-        # Ignore dc, as it is already captured by energy.
-        s2 = s2[:, 1:, :]
-        mod_freqs = mod_freqs[1:]
-        # Power law weighting for modulation frequency.
-        mod_weights = mod_freqs ** -0.5
-        mod_weights = mod_weights[None, :]
+        scales = [2.0, 1.0, 0.5, 0.3, 0.25, 0.1, 1 / 20]
+        # CWT is an ordinary Python list of (frequency, time) indexed by scale
+        cwt = get_cwt(s, self.frame_rate, scales)
 
-        result.update(self.get_stats(s2, prefix="modulation_spectrogram", weights=mod_weights))
+        cwt_stats: dict = {}
+        for scale, cwt_bin in zip(scales, cwt):
+            # A dict where each value has dimension (frequency,)
+            cwt_stats_for_scale = self.get_stats(cwt_bin, prefix="spectrogram_cwt")
+            weight = 1.0
+            # weight = scale **
+            for key, value in cwt_stats_for_scale.items():
+                cwt_stats.setdefault(key, [])
+                weighted_value = value * weight
+                cwt_stats[key].append(weighted_value)
+        # cwt_stats is a dict where each value is a Python list.
+        # Each element of the Python list corresponds to a different scale.
+        # Each element has dimensions (scale, frequency).
+        for key, value in cwt_stats.items():
+            cwt_stats[key] = torch.stack(value)
+        del cwt_stats["spectrogram_cwt_skewness"]
+        # del cwt_stats["spectrogram_cwt_kurtosis"]
+
+        # result.update(cwt_stats)
 
         return result
 
@@ -228,10 +253,10 @@ class ResynthesisFeatures(torch.nn.Module):
         return self.normalize_features(self.get_unnormalized_features(spectrogram))
 
     def forward(self):
-        return self.get_features(self.estimated_log_spectrogram)
+        return self.get_features(self.estimated_p_spectrogram)
 
-    def get_log_spectrogram(self):
-        return self.estimated_log_spectrogram.detach()
+    def get_p_spectrogram(self):
+        return self.estimated_p_spectrogram.detach()
 
 
 def resynthesize(
@@ -243,14 +268,14 @@ def resynthesize(
     start = time.time()
 
     model = ResynthesisFeatures(audio, sample_rate)
-    print_log_spectrogram_summary_stats(
-        "Target spectrogram", model.target_log_spectrogram
+    print_p_spectrogram_summary_stats(
+        "Target spectrogram", model.target_p_spectrogram
     )
 
     optimizer = torch.optim.Rprop(model.parameters(), lr=1.0)
 
     last_loss = None
-    log_spectrogram = None
+    p_spectrogram = None
 
     loss_function = torch.nn.functional.mse_loss
     reference_loss = loss_function(
@@ -271,7 +296,7 @@ def resynthesize(
     for snr in snr_table_linear:
         noise = torch.normal(0.0, 1.0, audio.shape) * reference_rms / snr
         noisy_audio = audio + noise
-        noisy_features = model.get_features(model.compute_log_spectrogram(noisy_audio))
+        noisy_features = model.get_features(model.compute_p_spectrogram(noisy_audio))
         snr_table_error.append(
             loss_to_error(loss_function(noisy_features, model.target_features))
         )
@@ -301,7 +326,7 @@ def resynthesize(
                 step_type = "initial"
             elif loss < last_loss:
                 step_type = "better"
-                log_spectrogram = model.get_log_spectrogram()
+                p_spectrogram = model.get_p_spectrogram()
             else:
                 step_type = "worse"
 
@@ -328,7 +353,7 @@ def resynthesize(
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
 
-    spectrogram = db_to_linear(log_spectrogram)
+    spectrogram = p_to_linear(p_spectrogram)
     # Zero out DC and Nyquist
     spectrogram[0, :] = 0
     spectrogram[-1, :] = 0
@@ -336,6 +361,12 @@ def resynthesize(
     logger.debug("Running phase reconstruction.")
     griffin_lim = torchaudio.transforms.GriffinLim(**model.spectrogram_kwargs)
     audio_out = griffin_lim.forward(spectrogram)
+
+    peak = torch.max(torch.abs(audio_out))
+    if peak > 1.0:
+        gain_db = linear_to_db(1 / peak)
+        logger.warning(f"Peak exceeds 0 dBFS, applying {gain_db:.2f} dB gain")
+        audio_out /= peak
 
     time_elapsed = time.time() - start
     minutes, seconds = divmod(int(time_elapsed), 60)
