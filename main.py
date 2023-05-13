@@ -58,9 +58,13 @@ def frequency_to_weight(freqs):
         log_reference_freqs,
         gain_db,
         bounds_error=False,
-        fill_value=(reference_freqs[0], reference_freqs[-1]),
+        fill_value=(log_reference_freqs[0], log_reference_freqs[-1]),
     )
     return db_to_linear(interpolator(np.log(freqs)))
+
+
+def signed_pow(base, exponent):
+    return torch.sign(base) * torch.abs(base) ** exponent
 
 
 def db_to_linear(db):
@@ -73,24 +77,24 @@ def linear_to_db(linear):
     return 20 * np.log10(linear)
 
 
-# See: Roodschild, Sardiñas, and Will. 2020.
-# "A new approach for the vanishing gradient problem on sigmoid activation."
-# https://link.springer.com/content/pdf/10.1007/s13748-020-00218-y.pdf
-BETA = 0.1
+P_SCALE = db_to_linear(60.0)
 
 
 def linear_to_p(linear):
     """Convert linear amplitude units to "P-units," a made-up psychoacoustic unit of volume
-    optimized for gradient descent on the differences between spectrogram amplitudes."""
-    return 20 * torch.log10(1 + torch.abs(linear)) * torch.sign(linear)
+    optimized for gradient descent on the differences between spectrogram amplitudes.
+
+    The linear scale is normalized so that 1.0 is a comfortable listening level of about 60 dB.
+
+    Although P-units are currently very similar to dB, I have decided not to explicitly call this a
+    log-spectrogram or dB spectrogram because the units might change later.
+    """
+    return 20 * torch.log10(1 + torch.abs(linear) * P_SCALE) * torch.sign(linear)
 
 
 def p_to_linear(p):
-    """Approximately convert P-units (see docs for linear_to_p) back to linear units.
-
-    The inversion does not perfectly recover the original value.
-    """
-    return ((10 ** torch.abs(p / 20)) - 1) * torch.sign(p)
+    """Convert P-units (see docs for linear_to_p) back to linear units."""
+    return ((10 ** torch.abs(p / 20)) - 1) * torch.sign(p) / P_SCALE
 
 
 def get_spectral_flatness(spectrum, axis=0):
@@ -131,6 +135,12 @@ def get_cwt(array, sample_rate, scales):
     return bins
 
 
+def get_spectrogram_reference_level(spectrogram, sample_rate):
+    t = torch.arange(spectrogram.hop_length * 50)
+    signal = torch.sin(441.0 * t * 2 * torch.pi)
+    return torch.max(torch.sum(spectrogram.forward(signal), dim=0))
+
+
 class ResynthesisFeatures(torch.nn.Module):
 
     def __init__(self, audio, sample_rate):
@@ -143,19 +153,23 @@ class ResynthesisFeatures(torch.nn.Module):
             "power": 1.0,
         }
         self.spectrogram = torchaudio.transforms.Spectrogram(**self.spectrogram_kwargs)
-        self.target_p_spectrogram = self.compute_p_spectrogram(audio)
+        target_linear_spectrogram = self.spectrogram.forward(audio)
+        self.scaling_factor = torch.mean(
+            torch.linalg.vector_norm(target_linear_spectrogram, ord=4, dim=0)
+        )
+        self.target_p_spectrogram = linear_to_p(target_linear_spectrogram / self.scaling_factor)
         if torch.any(torch.isnan(self.target_p_spectrogram)):
-            raise ValueError("NaN detected in log spectrogram")
+            raise ValueError("NaN detected in p-spectrogram")
 
         self.frame_rate = self.sample_rate / self.hop_length
 
         target_features_unnormalized = self.get_unnormalized_features(self.target_p_spectrogram)
         self.feature_weights = {
-            "p_spectrogram_energy": 10.0,
+            "spectrogram_energy": 10.0,
             "spectral_flux": 5.0,
             "covariance": 5.0,
             "transient": 10.0,
-            "modulation_cwt": 10.0,
+            "modulation_cwt": 50.0,
         }
         self.normalization_factors = {
             key: self.feature_weights.get(key, 1.0) / torch.sqrt(torch.mean(torch.square(value)))
@@ -173,15 +187,19 @@ class ResynthesisFeatures(torch.nn.Module):
         self.estimated_p_spectrogram = torch.nn.Parameter(initial_guess)
 
     def compute_p_spectrogram(self, audio):
-        return linear_to_p(self.spectrogram(audio))
+        return linear_to_p(
+            self.spectrogram.forward(audio)
+            / self.scaling_factor
+        )
 
     def get_stats(self, tensor, prefix, weights=1.0):
-        """Compute a standard set of statistics over the final axis of a tensor.
+        """Compute a standard set of statistics over the final axis of a tensor: energy (mean),
+        variance, skewness, kurtosis.
         """
-        energy = torch.mean(tensor, axis=-1) * weights
-        variance = torch.var(tensor, axis=-1) * weights
-        skewness = torch.sum((tensor - energy[..., None]) ** 3, axis=-1) * weights
-        kurtosis = torch.sum((tensor - energy[..., None]) ** 4, axis=-1) * weights
+        energy = torch.mean(tensor, dim=-1) * weights
+        variance = torch.var(tensor, dim=-1) ** (1 / 2) * weights
+        skewness = signed_pow(torch.sum((tensor - energy[..., None]) ** 3, dim=-1), 1 / 3) * weights
+        kurtosis = torch.sum((tensor - energy[..., None]) ** 4, dim=-1) ** (1 / 4) * weights
         return {
             f"{prefix}_energy": energy,
             f"{prefix}_variance": variance,
@@ -203,34 +221,52 @@ class ResynthesisFeatures(torch.nn.Module):
         s_p = p_spectrogram[frequency_slice, :]
         bin_indices = bin_indices[frequency_slice]
         bin_freqs = bin_freqs[frequency_slice]
-        # weights = torch.from_numpy(frequency_to_weight(bin_freqs))
-        # emphasis = torch.sqrt(weights)
-        # s_p = s_p * emphasis[:, None]
+        weights = torch.from_numpy(frequency_to_weight(bin_freqs))
 
-        result.update(self.get_stats(s_p, prefix="p_spectrogram"))
+        # s_p_weighted approximates a spectrum weighted for equal loudness.
+        # This is used to evaluate energy.
+        # Note that we can add because p-units are approximately logarithmic.
+        s_p_weighted = s_p + linear_to_p(weights)[:, None]
 
-        energy_by_frame = torch.mean(s_p, axis=0)
-        result["spectral_variance"] = torch.mean(torch.var(s_p, axis=0))
-        result["spectral_skewness"] = torch.mean((s_p - energy_by_frame[None, ...]) ** 3)
-        result["spectral_kurtosis"] = torch.mean((s_p - energy_by_frame[None, ...]) ** 4)
+        # s_p_emphasized is more subjective and attempts to scale each frequency bin by how much
+        # the difference contributes to the loss function.
+        emphasis = torch.sqrt(weights)
+        s_p_emphasized = s_p * emphasis[:, None]
+
+        result.update(self.get_stats(s_p_weighted, prefix="spectrogram", weights=emphasis))
+
+        # energy_by_frame = torch.mean(s_p_weighted, dim=0)
+        # result["spectral_variance"] = torch.mean(torch.var(s_p_weighted, dim=0)) ** (1 / 2)
+        # result["spectral_skewness"] = signed_pow(
+        #     torch.mean((s_p_weighted - energy_by_frame[None, ...]) ** 3),
+        #     1 / 3
+        # )
+        # result["spectral_kurtosis"] = torch.mean(
+        #     torch.mean((s_p_weighted - energy_by_frame[None, ...]) ** 4)
+        #  ) ** (1 / 4)
 
         # spectral_flatness = get_spectral_flatness(s)
         # result.update(self.get_stats(spectral_flatness, prefix="spectral_flatness"))
 
-        result["spectral_flux"] = torch.mean(torch.abs(torch.diff(s_p, dim=1)), dim=1)
+        # result["spectral_flux"] = torch.mean(torch.abs(torch.diff(s_p_emphasized, dim=1)), dim=1)
 
-        result.update(self.get_stats(energy_by_frame, prefix="energy"))
+        # result.update(self.get_stats(energy_by_frame, prefix="energy"))
 
-        covariance = torch.cov(s_p)
+        # Use squaring to make louder partials more important for covariance than quieter partials.
+        covariance = torch.cov(s_p * s_p)
         result["covariance"] = covariance
 
-        # s_squared = s * s
-        # transient = torch.sqrt(torch.mean(s_squared[:, :-1] / (s_squared[:, 1:] + 1e-3), axis=-1))
+        s_p_emphasized_2 = s_p_emphasized * s_p_emphasized
+        transient = torch.sqrt(
+            torch.mean(s_p_emphasized_2[:, :-1] / (s_p_emphasized_2[:, 1:] + 1e-3), dim=-1)
+        )
         # result["transient"] = transient
 
         scales = [2.0, 1.0, 0.5, 0.3, 0.25, 0.1, 1 / 20]
         # CWT is an ordinary Python list of (frequency, time) indexed by scale
-        cwt = get_cwt(s_p, self.frame_rate, scales)
+        # It's a list because each scale has a different hop size and each time axis has a different
+        # size.
+        cwt = get_cwt(s_p_emphasized, self.frame_rate, scales)
 
         cwt_stats: dict = {}
         for scale, cwt_bin in zip(scales, cwt):
@@ -245,10 +281,12 @@ class ResynthesisFeatures(torch.nn.Module):
         # has dimensions (scale, frequency).
         for key, value in cwt_stats.items():
             cwt_stats[key] = torch.stack(value)
-        del cwt_stats["spectrogram_cwt_skewness"]
-        del cwt_stats["spectrogram_cwt_kurtosis"]
 
         result.update(cwt_stats)
+
+        for key, value in result.items():
+            if torch.any(torch.isnan(value)):
+                raise ValueError(f"nan found in feature '{key}'")
 
         return result
 
@@ -367,7 +405,7 @@ def resynthesize(
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
 
-    spectrogram = p_to_linear(p_spectrogram)
+    spectrogram = p_to_linear(p_spectrogram) * model.scaling_factor
     # Zero out DC and Nyquist
     spectrogram[0, :] = 0
     spectrogram[-1, :] = 0
@@ -438,5 +476,4 @@ def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
-
     main()
