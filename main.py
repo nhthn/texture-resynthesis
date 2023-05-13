@@ -229,7 +229,7 @@ class ResynthesisFeatures(torch.nn.Module):
 
         scales = [2.0, 1.0, 0.5, 0.3, 0.25, 0.1, 1 / 20]
         # CWT is an ordinary Python list of (frequency, time) indexed by scale
-        cwt = get_cwt(s, self.frame_rate, scales)
+        cwt = get_cwt(s_p, self.frame_rate, scales)
 
         cwt_stats: dict = {}
         for scale, cwt_bin in zip(scales, cwt):
@@ -330,9 +330,9 @@ def resynthesize(
         for iteration_number in range(1, max_iterations + 1):
             logger.info(f"--- Iteration #{iteration_number} ---")
             prediction = model.forward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 100.0)
             loss = loss_function(prediction, model.target_features)
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 100.0)
             if last_loss is None:
                 step_type = "initial"
             elif loss < last_loss:
