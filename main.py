@@ -49,6 +49,20 @@ ISO_226_LU = [
 ]
 
 
+def frequency_to_weight(freqs):
+    table = np.array(ISO_226_LU)
+    reference_freqs = table[:, 0]
+    gain_db = table[:, 1]
+    log_reference_freqs = np.log(reference_freqs)
+    interpolator = scipy.interpolate.interp1d(
+        log_reference_freqs,
+        gain_db,
+        bounds_error=False,
+        fill_value=(reference_freqs[0], reference_freqs[-1]),
+    )
+    return db_to_linear(interpolator(np.log(freqs)))
+
+
 def db_to_linear(db):
     return 10 ** (db / 20)
 
@@ -77,17 +91,6 @@ def p_to_linear(p):
     The inversion does not perfectly recover the original value.
     """
     return ((10 ** torch.abs(p / 20)) - 1) * torch.sign(p)
-
-
-def frequency_to_weight(freqs):
-    table = np.array(ISO_226_LU)
-    reference_freqs = table[:, 0]
-    gain_db = table[:, 1]
-    log_reference_freqs = np.log(reference_freqs)
-    interpolator = scipy.interpolate.interp1d(
-        log_reference_freqs, gain_db, fill_value="extrapolate"
-    )
-    return db_to_linear(interpolator(np.log(freqs)))
 
 
 def get_spectral_flatness(spectrum, axis=0):
@@ -148,13 +151,10 @@ class ResynthesisFeatures(torch.nn.Module):
 
         target_features_unnormalized = self.get_unnormalized_features(self.target_p_spectrogram)
         self.feature_weights = {
-            "p_spectrogram_energy": 5.0,
-            "spectrogram_energy": 8.0,
+            "p_spectrogram_energy": 10.0,
             "spectral_flux": 5.0,
-            "covariance": 10.0,
-            "spectral_flatness_energy": 50.0,
-            "spectral_flatness_variance": 50.0,
-            "transient": 20.0,
+            "covariance": 5.0,
+            "transient": 10.0,
             "modulation_cwt": 10.0,
         }
         self.normalization_factors = {
@@ -162,11 +162,15 @@ class ResynthesisFeatures(torch.nn.Module):
             for key, value in target_features_unnormalized.items()
         }
         self.target_features = self.normalize_features(target_features_unnormalized)
-        self.estimated_p_spectrogram = torch.nn.Parameter(
-            torch.clip(torch.randn_like(self.target_p_spectrogram), -3, 1)
+
+        initial_guess = (
+            torch.clip(torch.randn_like(self.target_p_spectrogram), -3, 3)
             * torch.std(self.target_p_spectrogram)
             + torch.median(self.target_p_spectrogram)
         )
+        initial_guess = torch.clamp(initial_guess, min=0)
+
+        self.estimated_p_spectrogram = torch.nn.Parameter(initial_guess)
 
     def compute_p_spectrogram(self, audio):
         return linear_to_p(self.spectrogram(audio))
@@ -199,33 +203,30 @@ class ResynthesisFeatures(torch.nn.Module):
         s_p = p_spectrogram[frequency_slice, :]
         bin_indices = bin_indices[frequency_slice]
         bin_freqs = bin_freqs[frequency_slice]
-        weights = torch.from_numpy(frequency_to_weight(bin_freqs))
+        # weights = torch.from_numpy(frequency_to_weight(bin_freqs))
+        # emphasis = torch.sqrt(weights)
+        # s_p = s_p * emphasis[:, None]
 
         result.update(self.get_stats(s_p, prefix="p_spectrogram"))
 
-        s = p_to_linear(s_p)
-        s = s * weights[:, None]
-
-        # result.update(self.get_stats(s, prefix="spectrogram"))
-
-        energy_by_frame = torch.mean(s, axis=0)
-        result["spectral_variance"] = torch.mean(torch.var(s, axis=0))
-        result["spectral_skewness"] = torch.mean((s - energy_by_frame[None, ...]) ** 3)
-        result["spectral_kurtosis"] = torch.mean((s - energy_by_frame[None, ...]) ** 4)
+        energy_by_frame = torch.mean(s_p, axis=0)
+        result["spectral_variance"] = torch.mean(torch.var(s_p, axis=0))
+        result["spectral_skewness"] = torch.mean((s_p - energy_by_frame[None, ...]) ** 3)
+        result["spectral_kurtosis"] = torch.mean((s_p - energy_by_frame[None, ...]) ** 4)
 
         # spectral_flatness = get_spectral_flatness(s)
         # result.update(self.get_stats(spectral_flatness, prefix="spectral_flatness"))
 
-        result["spectral_flux"] = torch.mean(torch.abs(torch.diff(s, axis=1)), axis=1)
+        result["spectral_flux"] = torch.mean(torch.abs(torch.diff(s_p, dim=1)), dim=1)
 
         result.update(self.get_stats(energy_by_frame, prefix="energy"))
 
-        covariance = torch.cov(s)
+        covariance = torch.cov(s_p)
         result["covariance"] = covariance
 
-        s_squared = s * s
-        transient = torch.sqrt(torch.mean(s_squared[:, :-1] / (s_squared[:, 1:] + 1e-3), axis=-1))
-        result["transient"] = transient
+        # s_squared = s * s
+        # transient = torch.sqrt(torch.mean(s_squared[:, :-1] / (s_squared[:, 1:] + 1e-3), axis=-1))
+        # result["transient"] = transient
 
         scales = [2.0, 1.0, 0.5, 0.3, 0.25, 0.1, 1 / 20]
         # CWT is an ordinary Python list of (frequency, time) indexed by scale
@@ -235,15 +236,13 @@ class ResynthesisFeatures(torch.nn.Module):
         for scale, cwt_bin in zip(scales, cwt):
             # A dict where each value has dimension (frequency,)
             cwt_stats_for_scale = self.get_stats(cwt_bin, prefix="spectrogram_cwt")
-            weight = 1.0
-            # weight = scale **
+            weight = scale ** 0.5
             for key, value in cwt_stats_for_scale.items():
                 cwt_stats.setdefault(key, [])
                 weighted_value = value * weight
                 cwt_stats[key].append(weighted_value)
-        # cwt_stats is a dict where each value is a Python list.
-        # Each element of the Python list corresponds to a different scale.
-        # Each element has dimensions (scale, frequency).
+        # cwt_stats is a dict where each key is a different statistical feature and each value
+        # has dimensions (scale, frequency).
         for key, value in cwt_stats.items():
             cwt_stats[key] = torch.stack(value)
         del cwt_stats["spectrogram_cwt_skewness"]
@@ -266,7 +265,8 @@ class ResynthesisFeatures(torch.nn.Module):
         return self.get_features(self.estimated_p_spectrogram)
 
     def get_p_spectrogram(self):
-        return self.estimated_p_spectrogram.detach()
+        # Clip off the first few opening and ending frames as edge artifacts can happen.
+        return self.estimated_p_spectrogram[:, 3:-3].detach()
 
 
 def resynthesize(
@@ -438,4 +438,5 @@ def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
+
     main()
