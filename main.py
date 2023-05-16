@@ -97,11 +97,10 @@ def p_to_linear(p):
     return ((10 ** torch.abs(p / 20)) - 1) * torch.sign(p) / P_SCALE
 
 
-def get_spectral_flatness(spectrum, axis=0):
-    p_spectrogram = torch.log(1 + torch.abs(spectrum))
+def get_spectral_flatness(p_spectrum, axis=0):
     return (
-        torch.exp(torch.mean(spectrum, axis=axis))
-        / (1 + torch.mean(torch.abs(spectrum), axis=axis))
+        torch.mean(p_spectrum, dim=axis)
+        / (1 + torch.log(torch.mean(torch.exp(p_spectrum), dim=axis)))
     )
 
 
@@ -116,17 +115,23 @@ def print_p_spectrogram_summary_stats(prefix, p_spectrogram):
 
 
 def get_cwt(array, sample_rate, scales):
+    """Compute the Continuous Wavelet Transform at a number of scales. The last dimension of the
+    input array is assumed to be time.
+    """
     bins = []
     for scale in scales:
         window_size = int(scale * sample_rate)
         hop_size = window_size // 4
+        padded = torch.nn.functional.pad(
+            array, (window_size // 2, window_size // 2), mode="reflect"
+        )
         window = (
             torch.hann_window(window_size)
-            # * torch.sin(2 * torch.pi * torch.arange(window_size) / window_size)
-            * scale ** 0.5
+            * torch.sin(2 * torch.pi * torch.arange(window_size) / window_size)
         )
+        window = window / torch.sqrt(torch.sum(torch.square(window)))
         # Dimensions: (..., frame, time)
-        windows = array.unfold(-1, window_size, hop_size)
+        windows = padded.unfold(-1, window_size, hop_size)
         while window.ndim < windows.ndim:
             window = torch.unsqueeze(window, dim=0)
         windows = windows * window
@@ -165,14 +170,18 @@ class ResynthesisFeatures(torch.nn.Module):
 
         target_features_unnormalized = self.get_unnormalized_features(self.target_p_spectrogram)
         self.feature_weights = {
-            "spectrogram_energy": 10.0,
-            "spectral_flux": 5.0,
+            "spectrogram_energy": 30.0,
+            "spectral_flux_energy": 10.0,
+            "spectral_flatness_energy": 10.0,
             "covariance": 5.0,
-            "transient": 10.0,
-            "modulation_cwt": 50.0,
+            "cwt_energy": 5.0,
+        }
+        self.feature_rms = {
+            key: torch.sqrt(torch.mean(torch.square(value)))
+            for key, value in target_features_unnormalized.items()
         }
         self.normalization_factors = {
-            key: self.feature_weights.get(key, 1.0) / torch.sqrt(torch.mean(torch.square(value)))
+            key: self.feature_weights.get(key, 0.0) / self.feature_rms[key]
             for key, value in target_features_unnormalized.items()
         }
         self.target_features = self.normalize_features(target_features_unnormalized)
@@ -192,7 +201,13 @@ class ResynthesisFeatures(torch.nn.Module):
             / self.scaling_factor
         )
 
-    def get_stats(self, tensor, prefix, weights=1.0):
+    def debug_features(self):
+        for key in self.target_features.keys():
+            weight = self.feature_weights.get(key, 0.0)
+            if weight != 0:
+                logger.debug(f"{key}: target RMS = {self.feature_rms[key]}")
+
+    def get_stats(self, tensor: torch.Tensor, prefix: str, weights: float | torch.Tensor = 1.0):
         """Compute a standard set of statistics over the final axis of a tensor: energy (mean),
         variance, skewness, kurtosis.
         """
@@ -245,10 +260,11 @@ class ResynthesisFeatures(torch.nn.Module):
         #     torch.mean((s_p_weighted - energy_by_frame[None, ...]) ** 4)
         #  ) ** (1 / 4)
 
-        # spectral_flatness = get_spectral_flatness(s)
-        # result.update(self.get_stats(spectral_flatness, prefix="spectral_flatness"))
+        spectral_flatness = get_spectral_flatness(s_p_weighted)
+        result.update(self.get_stats(spectral_flatness, prefix="spectral_flatness"))
 
-        # result["spectral_flux"] = torch.mean(torch.abs(torch.diff(s_p_emphasized, dim=1)), dim=1)
+        spectral_flux = torch.abs(torch.diff(s_p_emphasized, dim=1))
+        result.update(self.get_stats(spectral_flux, prefix="spectral_flux"))
 
         # result.update(self.get_stats(energy_by_frame, prefix="energy"))
 
@@ -262,17 +278,18 @@ class ResynthesisFeatures(torch.nn.Module):
         )
         # result["transient"] = transient
 
-        scales = [2.0, 1.0, 0.5, 0.3, 0.25, 0.1, 1 / 20]
+        scales = np.geomspace(1.0, 1 / (self.frame_rate / 4), 10, endpoint=True)
         # CWT is an ordinary Python list of (frequency, time) indexed by scale
         # It's a list because each scale has a different hop size and each time axis has a different
         # size.
-        cwt = get_cwt(s_p_emphasized, self.frame_rate, scales)
+        cwt = get_cwt(s_p, self.frame_rate, scales)
 
         cwt_stats: dict = {}
         for scale, cwt_bin in zip(scales, cwt):
             # A dict where each value has dimension (frequency,)
-            cwt_stats_for_scale = self.get_stats(cwt_bin, prefix="spectrogram_cwt")
-            weight = scale ** 0.5
+            cwt_stats_for_scale = self.get_stats(cwt_bin, prefix="cwt", weights=emphasis)
+            # weight = 1.0
+            weight = 1.0
             for key, value in cwt_stats_for_scale.items():
                 cwt_stats.setdefault(key, [])
                 weighted_value = value * weight
@@ -281,7 +298,6 @@ class ResynthesisFeatures(torch.nn.Module):
         # has dimensions (scale, frequency).
         for key, value in cwt_stats.items():
             cwt_stats[key] = torch.stack(value)
-
         result.update(cwt_stats)
 
         for key, value in result.items():
@@ -291,10 +307,10 @@ class ResynthesisFeatures(torch.nn.Module):
         return result
 
     def normalize_features(self, features):
-        return torch.concatenate([
-            torch.flatten(value * self.normalization_factors[key])
+        return {
+            key: value * self.normalization_factors[key]
             for key, value in features.items()
-        ])
+        }
 
     def get_features(self, spectrogram):
         return self.normalize_features(self.get_unnormalized_features(spectrogram))
@@ -320,16 +336,25 @@ def resynthesize(
         "Target spectrogram", model.target_p_spectrogram
     )
 
+    model.debug_features()
+
     optimizer = torch.optim.Rprop(model.parameters(), lr=1.0)
 
-    loss_function = torch.nn.functional.mse_loss
-    reference_loss = loss_function(
-        model.target_features,
-        torch.zeros_like(model.target_features)
-    )
+    def norm(features):
+        result = torch.tensor(0.0)
+        for value in features.values():
+            result += torch.linalg.vector_norm(value)
+        return result
 
-    def loss_to_error(loss):
-        return np.sqrt(float(loss / reference_loss))
+    reference_error = norm(model.target_features)
+
+    def error_function(actual, expected):
+        result = torch.tensor(0.0)
+        for key in expected.keys():
+            result += torch.linalg.vector_norm(
+                expected[key] - actual[key]
+            )
+        return result / reference_error
 
     logger.debug("Building SNR table...")
 
@@ -343,7 +368,7 @@ def resynthesize(
         noisy_audio = audio + noise
         noisy_features = model.get_features(model.compute_p_spectrogram(noisy_audio))
         snr_table_error.append(
-            loss_to_error(loss_function(noisy_features, model.target_features))
+            error_function(noisy_features, model.target_features)
         )
 
     regression_result = scipy.stats.linregress(snr_table_error, inv_snr_table_linear)
@@ -359,8 +384,8 @@ def resynthesize(
         logger.warning(f"R^2 of SNR table < {r_squared_thresold}. SNR estimator may be inaccurate.")
     snr_interpolator = scipy.interpolate.interp1d(snr_table_error, inv_snr_table_linear, fill_value="extrapolate")
 
-    last_loss = None
-    best_loss = np.inf
+    last_error = None
+    best_error = np.inf
     p_spectrogram = None
     error_history = []
     snr_history = []
@@ -368,36 +393,36 @@ def resynthesize(
         for iteration_number in range(1, max_iterations + 1):
             logger.info(f"--- Iteration #{iteration_number} ---")
             prediction = model.forward()
-            loss = loss_function(prediction, model.target_features)
-            loss.backward()
+            error = error_function(prediction, model.target_features)
+            error.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 100.0)
-            if last_loss is None:
+            if last_error is None:
                 step_type = "initial"
-            elif loss < last_loss:
+            elif error < last_error:
                 step_type = "better"
             else:
                 step_type = "worse"
-            if loss < best_loss:
+            if error < best_error:
                 p_spectrogram = model.get_p_spectrogram()
-                best_loss = loss
+                best_error = error
 
-            error = loss_to_error(loss)
-            inv_snr_linear = snr_interpolator(error)
+            error_float = float(error.detach())
+            inv_snr_linear = snr_interpolator(error_float)
             snr_db = linear_to_db(1 / inv_snr_linear)
 
-            error_history.append(error)
+            error_history.append(error_float)
             snr_history.append(snr_db)
             logger.info(
-                f"Error = {error * 100:.2f}% ({step_type}), "
+                f"Error = {error_float * 100:.2f}% ({step_type}), "
                 f"estimated SNR = {snr_db:.2f} dB, "
-                f"gradient norm = {grad_norm:.2f}"
+                f"gradient norm = {grad_norm:.2e}"
             )
-            if error > 1e10 or np.isnan(error):
+            if error_float > 1e10 or np.isnan(error_float):
                 raise ValueError("Very high relative error, something is wrong")
             if snr_db > target_snr_db:
                 logger.info("Target SNR reached.")
                 break
-            last_loss = loss
+            last_error = error_float
             optimizer.step()
             optimizer.zero_grad()
         else:
